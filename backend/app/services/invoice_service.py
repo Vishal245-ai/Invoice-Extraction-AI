@@ -191,14 +191,6 @@ def process_invoice(file_path: str) -> Dict[str, Any]:
         is_duplicate = current in existing_set
         data["is_duplicate"] = is_duplicate
 
-        # 🔥 STOP DUPLICATE INSERT
-        if is_duplicate:
-            return {
-                "status": "duplicate",
-                "message": "Invoice already exists",
-                "data": data
-            }
-
         # ----------------------------
         # HIGHLIGHTS
         # ----------------------------
