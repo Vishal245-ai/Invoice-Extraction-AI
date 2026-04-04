@@ -33,24 +33,51 @@ def safe_json_load(text: str):
     return {}
 
 # ----------------------------
-# ✅ PRODUCT FROM RAW OCR (🔥 BEST METHOD)
+# 🔥 ENTERPRISE PRODUCT EXTRACTION
 # ----------------------------
 def extract_product_from_text(text):
     """
-    Extract clean product name (stop before numeric columns)
+    Multi-line, multi-brand product extraction
     """
-    match = re.search(
-        r"\d+\s+([A-Za-z0-9\s\-]+?)(?=\s+\d{4,}|\s+\d+\.\d{2})",
-        text
-    )
-    if match:
-       name = match.group(1).strip()
-    # remove trailing junk if any
-    name = re.sub(r"\s{2,}", " ", name)
-    name = re.sub(r"[^\w\s\-]", "", name)
-    
-    return name
-    return None
+
+    pattern = r"(ITEM DESCRIPTION.*?\n)(.*?)(\n\s*(Sub|Grand total))"
+    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+
+    if not match:
+        return None
+
+    block = match.group(2)
+    lines = block.split("\n")
+
+    product_lines = []
+
+    for line in lines:
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Remove noise
+        if re.search(r"(HSN|IMEI|GST|CGST|SGST|IGST|UOM|DISCOUNT|RATE|AMOUNT)", line, re.I):
+            continue
+
+        if re.fullmatch(r"[\d\s\.]+", line):
+            continue
+
+        if len(line) > 5:
+            product_lines.append(line)
+
+    name = " ".join(product_lines)
+
+    # Clean
+    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"\b\d{10,}\b", "", name)  # IMEI remove
+    name = re.sub(r"\b\d+\b$", "", name)     # trailing number remove
+    name = name.strip()
+
+    return name if len(name) > 10 else None
+
+
 # ----------------------------
 # ✅ VENDOR EXTRACTION
 # ----------------------------
@@ -65,6 +92,7 @@ def match_vendor(text):
     extracted = extract_vendor(text)
     match = get_close_matches(extracted, VENDOR_DB, n=1, cutoff=0.6)
     return match[0] if match else extracted
+
 
 # ----------------------------
 # ✅ TOTAL + GST
@@ -89,6 +117,7 @@ def extract_totals(text):
 
     return data
 
+
 # ----------------------------
 # TABLE BLOCK
 # ----------------------------
@@ -112,8 +141,9 @@ def extract_table_block(text):
 
     return table_lines
 
+
 # ----------------------------
-# ✅ SMART TABLE PARSER (FIXED)
+# 🔥 SMART TABLE PARSER (IMPROVED)
 # ----------------------------
 def extract_rows(table_lines):
     rows = []
@@ -121,14 +151,13 @@ def extract_rows(table_lines):
 
     for line in table_lines:
 
-        # ❌ Skip garbage lines
         if re.search(r"(HSN|IMEI|GST|CGST|SGST|IGST|UOM|DISCOUNT)", line, re.I):
             continue
 
         if re.search(r"(AMOUNT|RATE|TAX|TOTAL)", line, re.I):
             continue
 
-        # Product text continuation
+        # collect product lines
         if not re.search(r"\d+\.\d{2}", line):
             if len(line.split()) > 2:
                 product_lines.append(line)
@@ -138,21 +167,17 @@ def extract_rows(table_lines):
         if not numbers:
             continue
 
-        # price selection
-        price_candidates = [n for n in numbers if n > 1000]
-        price = max(price_candidates) if price_candidates else max(numbers)
+        price = max(numbers)
 
-        # quantity
         quantity = 1
         qty_match = re.search(r"\b([1-9]|10)\b", line)
         if qty_match:
             quantity = int(qty_match.group(1))
 
-        # merge product name
         name = " ".join(product_lines)
 
-        # clean
-        name = re.sub(r"(AMOUNT|RATE|TAX|CGST|SGST|IGST)", "", name, flags=re.I)
+        # 🔥 CLEAN
+        name = re.sub(r"(HSN|IMEI|GST|CGST|SGST|IGST|RATE|AMOUNT)", "", name, flags=re.I)
         name = re.sub(r"\b\d{10,}\b", "", name)
         name = re.sub(r"\s+", " ", name).strip()
 
@@ -169,12 +194,14 @@ def extract_rows(table_lines):
 
     return rows
 
+
 # ----------------------------
 # MAIN LINE ITEM EXTRACTION
 # ----------------------------
 def extract_line_items_smart(text):
     table = extract_table_block(text)
     return extract_rows(table)
+
 
 # ----------------------------
 # BASIC EXTRACTION
@@ -191,6 +218,7 @@ def extract_basic(text):
         data["invoice_date"] = date.group(1)
 
     return data
+
 
 # ----------------------------
 # 🤖 AI CONFIDENCE
@@ -217,6 +245,7 @@ DATA:
     except:
         return 0.95
 
+
 # ----------------------------
 # 🚀 MAIN PARSER
 # ----------------------------
@@ -225,30 +254,32 @@ def parse_invoice(ocr_text: str, hint=None):
     base = extract_basic(ocr_text)
     totals = extract_totals(ocr_text)
 
-    # 🔥 PRIORITY PRODUCT EXTRACTION
+    # 🔥 PRIMARY PRODUCT EXTRACTION
     direct_product = extract_product_from_text(ocr_text)
 
     # fallback table parser
     items = extract_line_items_smart(ocr_text)
 
-    # 🔥 OVERRIDE (fixes your issue)
-    if direct_product:
+    # 🔥 OVERRIDE (SMART)
+    if direct_product and len(direct_product) > 10:
         items = [{
             "product_name": direct_product,
             "quantity": 1,
             "price": totals.get("total", 0)
         }]
 
-    # Gemini cleanup
+    # ----------------------------
+    # GEMINI CLEANUP
+    # ----------------------------
     try:
         if items:
             prompt = f"""
-Clean product names only. Do NOT change price or quantity.
+Clean product names only.
+Do NOT change price or quantity.
+Return JSON list only.
 
 DATA:
 {json.dumps(items)}
-
-Return JSON list only.
 """
             response = client.models.generate_content(
                 model="gemini-2.5-pro",
@@ -262,6 +293,19 @@ Return JSON list only.
 
     except Exception as e:
         print("⚠️ Gemini failed:", e)
+
+    # ----------------------------
+    # FINAL CLEANUP
+    # ----------------------------
+    for item in items:
+        name = item.get("product_name", "")
+
+        name = re.sub(r"\n", " ", name)
+        name = re.sub(r"\s+", " ", name)
+        name = re.sub(r"\b\d+\b$", "", name)
+        name = name.strip()
+
+        item["product_name"] = name
 
     # fallback safety
     if not items:
