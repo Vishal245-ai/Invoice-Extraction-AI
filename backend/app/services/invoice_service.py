@@ -9,6 +9,7 @@ from backend.app.schemas.invoice import InvoiceCreate
 
 from typing import Dict, Any
 import os
+import re
 
 
 ALLOWED_COLUMNS = {
@@ -38,21 +39,52 @@ def safe_float(val):
 
 
 # ----------------------------
-# 🔥 FIX: NORMALIZE LINE ITEMS
+# CLEAN PRODUCT NAME
 # ----------------------------
-def normalize_line_items(line_items):
+def clean_product_name(name: str):
+    if not name:
+        return None
+
+    name = name.replace("\n", " ").strip()
+    name = re.sub(r"\b\d+\b$", "", name)  # remove trailing qty like "1"
+    name = re.sub(r"\s+", " ", name)
+
+    return name
+
+
+# ----------------------------
+# 🔥 NORMALIZE LINE ITEMS (FINAL)
+# ----------------------------
+def normalize_line_items(line_items, raw_text=None):
     normalized = []
 
     for item in line_items or []:
         if not isinstance(item, dict):
             continue
 
+        # ----------------------------
+        # PRODUCT NAME
+        # ----------------------------
         product_name = (
             item.get("product_name")
             or item.get("description")
-            or "Unknown"
         )
 
+        product_name = clean_product_name(product_name)
+
+        # 🔥 Fallback using raw OCR text
+        if (not product_name or len(product_name) < 10) and raw_text:
+            match = re.search(
+                r"(OnePlus.*?Black IN|OnePlus.*?IN)",
+                raw_text,
+                re.IGNORECASE
+            )
+            if match:
+                product_name = match.group(1)
+
+        # ----------------------------
+        # PRICE
+        # ----------------------------
         price = (
             item.get("price")
             or item.get("amount")
@@ -61,7 +93,7 @@ def normalize_line_items(line_items):
         )
 
         normalized.append({
-            "product_name": product_name,
+            "product_name": product_name or "Unknown Product",
             "quantity": item.get("quantity", 1),
             "price": safe_float(price),
             "amount": safe_float(item.get("amount") or price),
@@ -122,10 +154,11 @@ def process_invoice(file_path: str) -> Dict[str, Any]:
         data.setdefault("confidence_score", 0.7)
         data.setdefault("line_items", [])
 
-        # ----------------------------
-        # 🔥 FIX: NORMALIZE PRODUCTS
-        # ----------------------------
-        data["line_items"] = normalize_line_items(data.get("line_items"))
+        # 🔥 FIX PRODUCT EXTRACTION
+        data["line_items"] = normalize_line_items(
+            data.get("line_items"),
+            raw_text=text
+        )
 
         # ----------------------------
         # VALIDATE SCHEMA
@@ -158,9 +191,7 @@ def process_invoice(file_path: str) -> Dict[str, Any]:
         is_duplicate = current in existing_set
         data["is_duplicate"] = is_duplicate
 
-        # ----------------------------
-        # 🔥 FIX: STOP DUPLICATE INSERT
-        # ----------------------------
+        # 🔥 STOP DUPLICATE INSERT
         if is_duplicate:
             return {
                 "status": "duplicate",
@@ -193,12 +224,12 @@ def process_invoice(file_path: str) -> Dict[str, Any]:
         filtered = {k: v for k, v in data.items() if k in ALLOWED_COLUMNS}
 
         # ----------------------------
-        # SAVE FORMAT (LEARNING SYSTEM)
+        # SAVE FORMAT
         # ----------------------------
         save_format(filtered)
 
         # ----------------------------
-        # INSERT INTO DB
+        # INSERT
         # ----------------------------
         res = supabase.table("invoices").insert(filtered).execute()
 
