@@ -1,51 +1,94 @@
-from PIL import Image
-import pytesseract
-from pdf2image import convert_from_path
-import os
-
-# ✅ Set tesseract path (REQUIRED for Render)
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+import requests
+from backend.app.config import OCR_API_KEY
 
 
 def extract_text(file_path):
     try:
-        print(f"📄 Processing file: {file_path}")
+        print(f"📄 OCR API processing: {file_path}")
 
-        text = ""
-
-        # ----------------------------
-        # PDF → IMAGE → OCR
-        # ----------------------------
-        if file_path.lower().endswith(".pdf"):
-            images = convert_from_path(
-                file_path,
-                poppler_path="/usr/bin"  # ✅ REQUIRED for Render
-            )
-
-            print(f"📑 Pages detected: {len(images)}")
-
-            for i, img in enumerate(images):
-                page_text = pytesseract.image_to_string(img)
-                print(f"🧾 Page {i+1} OCR length:", len(page_text))
-
-                text += page_text + "\n"
-
-        # ----------------------------
-        # IMAGE → OCR
-        # ----------------------------
-        else:
-            image = Image.open(file_path)
-            text = pytesseract.image_to_string(image)
-
-        # ----------------------------
-        # VALIDATION
-        # ----------------------------
-        if not text.strip():
-            print("⚠️ OCR returned empty text")
+        if not OCR_API_KEY:
+            print("❌ OCR_API_KEY missing")
             return ""
 
-        return text.strip()
+        url = "https://api.ocr.space/parse/image"
+
+        # ----------------------------
+        # RETRY LOGIC (VERY IMPORTANT)
+        # ----------------------------
+        for attempt in range(2):
+            try:
+                with open(file_path, "rb") as f:
+                    response = requests.post(
+                        url,
+                        files={"file": f},
+                        data={
+                            "apikey": OCR_API_KEY,
+                            "language": "eng",
+                            "OCREngine": 2,
+                            "scale": True,
+                            "detectOrientation": True,
+                            "isTable": True  # 🔥 improves table OCR
+                        },
+                        timeout=30
+                    )
+
+                if response.status_code != 200:
+                    print(f"❌ OCR HTTP error: {response.status_code}")
+                    continue
+
+                result = response.json()
+
+                # ----------------------------
+                # HANDLE OCR API ERROR
+                # ----------------------------
+                if result.get("IsErroredOnProcessing"):
+                    print("❌ OCR API Error:", result.get("ErrorMessage"))
+                    continue
+
+                parsed_results = result.get("ParsedResults")
+
+                if not parsed_results:
+                    print("⚠️ No parsed results")
+                    continue
+
+                # ----------------------------
+                # EXTRACT TEXT
+                # ----------------------------
+                text = "\n".join(
+                    item.get("ParsedText", "")
+                    for item in parsed_results
+                )
+
+                # ----------------------------
+                # CLEAN TEXT (CRITICAL)
+                # ----------------------------
+                text = text.replace("\r", "")
+
+                text = "\n".join(
+                    line.strip()
+                    for line in text.split("\n")
+                    if line.strip()
+                )
+
+                # ----------------------------
+                # VALIDATION
+                # ----------------------------
+                if len(text) < 20:
+                    print("⚠️ OCR text too small, retrying...")
+                    continue
+
+                print(f"✅ OCR success | Length: {len(text)}")
+                return text
+
+            except requests.exceptions.Timeout:
+                print("⚠️ OCR timeout, retrying...")
+
+        # ----------------------------
+        # FINAL FAILURE
+        # ----------------------------
+        print("❌ OCR failed after retries")
+        return ""
 
     except Exception as e:
-        print("❌ OCR Error:", str(e))
+        print("❌ OCR Exception:", e)
         return ""

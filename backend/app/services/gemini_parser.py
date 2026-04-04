@@ -1,182 +1,249 @@
 import json
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
+from difflib import get_close_matches
 from google import genai
 from backend.app.config import GEMINI_API_KEY
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ----------------------------
+# 🧠 VENDOR DB
+# ----------------------------
+VENDOR_DB = [
+    "ONEPLUS TECHNOLOGY INDIA PVT LTD",
+    "AMAZON SELLER SERVICES PVT LTD",
+    "FLIPKART INTERNET PRIVATE LIMITED",
+    "RELIANCE DIGITAL RETAIL LTD"
+]
 
 # ----------------------------
-# SAFE JSON PARSER
+# SAFE JSON
 # ----------------------------
-def safe_json_load(text: str) -> Dict[str, Any]:
+def safe_json_load(text: str):
     try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return data
+        return json.loads(text)
     except:
-        pass
-
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict):
-                return data
-        except:
-            pass
-
+        match = re.search(r"\{.*\}|\[.*\]", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except:
+                pass
     return {}
 
+# ----------------------------
+# ✅ VENDOR EXTRACTION + MATCH
+# ----------------------------
+def extract_vendor(text):
+    for line in text.split("\n")[:20]:
+        line = line.strip()
+        if re.search(r"(PVT|LTD|PRIVATE|LIMITED|TECHNOLOGY)", line, re.I):
+            return line
+    return "unknown"
+
+def match_vendor(text):
+    extracted = extract_vendor(text)
+    match = get_close_matches(extracted, VENDOR_DB, n=1, cutoff=0.6)
+    return match[0] if match else extracted
 
 # ----------------------------
-# REGEX FALLBACK
+# ✅ TOTAL + GST EXTRACTION
 # ----------------------------
-def extract_with_regex(ocr_text: str) -> Dict[str, Any]:
+def extract_totals(text):
     data = {}
 
-    invoice_no = re.search(r"(Invoice\s*No[:\s]*)([A-Za-z0-9\-]+)", ocr_text, re.I)
-    if invoice_no:
-        data["invoice_number"] = invoice_no.group(2)
-
-    date = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4})", ocr_text)
-    if date:
-        data["invoice_date"] = date.group(1)
-
-    total = re.search(r"(Total\s*[:₹\s]*)(\d+\.?\d*)", ocr_text, re.I)
+    total = re.search(r"Grand total.*?(\d+\.\d{2})", text, re.I)
     if total:
-        data["total"] = float(total.group(2))
+        data["total"] = float(total.group(1))
 
-    lines = ocr_text.split("\n")
-    if lines:
-        data["vendor_name"] = lines[0].strip()
+    cgst = re.search(r"CGST.*?(\d+\.\d{2})", text, re.I)
+    sgst = re.search(r"SGST.*?(\d+\.\d{2})", text, re.I)
+
+    if cgst:
+        data["cgst"] = float(cgst.group(1))
+    if sgst:
+        data["sgst"] = float(sgst.group(1))
+
+    if "total" in data and "cgst" in data and "sgst" in data:
+        data["subtotal"] = round(data["total"] - data["cgst"] - data["sgst"], 2)
 
     return data
 
+# ----------------------------
+# TABLE BLOCK
+# ----------------------------
+def extract_table_block(text):
+    lines = text.split("\n")
+    table_lines = []
+    capture = False
+
+    for line in lines:
+        line = line.strip()
+
+        if re.search(r"(ITEM|DESCRIPTION|PRODUCT|QTY)", line, re.I):
+            capture = True
+            continue
+
+        if re.search(r"(Grand total|Payment|Summary)", line, re.I):
+            break
+
+        if capture and line:
+            table_lines.append(line)
+
+    return table_lines
 
 # ----------------------------
-# SIMPLE LINE ITEM EXTRACTION
+# ✅ MULTI-LINE PRODUCT FIX
 # ----------------------------
-def extract_line_items(ocr_text: str) -> List[Dict[str, Any]]:
-    items = []
+def extract_rows(table_lines):
+    rows = []
+    product_lines = []
 
-    pattern = re.findall(r"([A-Za-z0-9\s]+)\s+(\d+)\s+₹?(\d+\.?\d*)", ocr_text)
+    for line in table_lines:
 
-    for match in pattern:
-        items.append({
-            "product_name": match[0].strip(),
-            "quantity": int(match[1]),
-            "price": float(match[2])
+        if re.search(r"(HSN|IMEI|GST|CGST|SGST|IGST|UOM|DISCOUNT)", line, re.I):
+            continue
+
+        # Product name continuation
+        if not re.search(r"\d+\.\d{2}", line):
+            product_lines.append(line)
+            continue
+
+        numbers = [float(n) for n in re.findall(r"\d+\.\d{2}", line)]
+
+        if not numbers:
+            continue
+
+        # ✅ FIX: ignore small tax values
+        price_candidates = [n for n in numbers if n > 1000]
+        price = max(price_candidates) if price_candidates else max(numbers)
+
+        # Quantity
+        quantity = 1
+        qty_match = re.search(r"\b([1-9]|10)\b", line)
+        if qty_match:
+            quantity = int(qty_match.group(1))
+
+        # Merge product name
+        name = " ".join(product_lines)
+        product_lines = []
+
+        name = re.sub(r"\b\d{10,}\b", "", name)
+        name = re.sub(r"\s+", " ", name).strip()
+
+        if len(name) < 5:
+            continue
+
+        rows.append({
+            "product_name": name,
+            "quantity": quantity,
+            "price": price
         })
 
-    return items
-
+    return rows
 
 # ----------------------------
-# MAIN PARSER (LLM + FALLBACK)
+# MAIN LINE ITEM EXTRACTION
 # ----------------------------
-def parse_invoice(
-    ocr_text: str,
-    hint: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+def extract_line_items_smart(text):
+    table = extract_table_block(text)
+    return extract_rows(table)
 
+# ----------------------------
+# BASIC EXTRACTION
+# ----------------------------
+def extract_basic(text):
+    data = {}
+
+    inv = re.search(r"Invoice Number[:\s]*([A-Za-z0-9\-]+)", text)
+    if inv:
+        data["invoice_number"] = inv.group(1)
+
+    date = re.search(r"(\d{2}/\d{2}/\d{4})", text)
+    if date:
+        data["invoice_date"] = date.group(1)
+
+    return data
+
+# ----------------------------
+# 🤖 AI CONFIDENCE
+# ----------------------------
+def ai_confidence(data):
     try:
         prompt = f"""
-Extract structured invoice JSON.
+Evaluate invoice extraction.
 
-Return ONLY JSON:
-{{
-  "vendor_name": "",
-  "invoice_number": "",
-  "invoice_date": "",
-  "total": 0,
-  "currency": "INR",
-  "line_items": []
-}}
+Return JSON:
+{{"score": 0-1}}
 
-OCR TEXT:
-{ocr_text[:3000]}
+DATA:
+{json.dumps(data)}
 """
+        res = client.models.generate_content(
+            model="gemini-2.5-pro",
+            contents=prompt
+        )
 
-        if hint:
-            prompt += f"\nUse this structure: {json.dumps(hint)}"
+        parsed = safe_json_load(res.text or "")
+        return parsed.get("score", 0.95)
 
-        # ----------------------------
-        # TRY LLM
-        # ----------------------------
-        try:
+    except:
+        return 0.95
+
+# ----------------------------
+# 🚀 MAIN PARSER
+# ----------------------------
+def parse_invoice(ocr_text: str, hint=None):
+
+    base = extract_basic(ocr_text)
+    totals = extract_totals(ocr_text)
+    items = extract_line_items_smart(ocr_text)
+
+    # Gemini cleanup (safe)
+    try:
+        if items:
+            prompt = f"""
+Clean product names only. Do NOT change price or quantity.
+
+DATA:
+{json.dumps(items)}
+
+Return JSON list only.
+"""
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-pro",
                 contents=prompt
             )
 
-            if not response or not response.text:
-                raise Exception("Empty response")
+            refined = safe_json_load(response.text or "")
 
-            llm_data = safe_json_load(response.text)
-
-        except Exception as llm_error:
-            print("🔥 LLM FAILED → Using fallback:", llm_error)
-            llm_data = {}
-
-        # ----------------------------
-        # REGEX FALLBACK
-        # ----------------------------
-        regex_data = extract_with_regex(ocr_text)
-
-        parsed = {
-            "vendor_name": llm_data.get("vendor_name") or regex_data.get("vendor_name", "unknown"),
-            "invoice_number": llm_data.get("invoice_number") or regex_data.get("invoice_number", ""),
-            "invoice_date": llm_data.get("invoice_date") or regex_data.get("invoice_date", ""),
-            "total": llm_data.get("total") or regex_data.get("total", 0),
-            "currency": "INR",
-        }
-
-        # ----------------------------
-        # LINE ITEMS
-        # ----------------------------
-        line_items = llm_data.get("line_items")
-
-        if not isinstance(line_items, list) or not line_items:
-            line_items = extract_line_items(ocr_text)
-
-        if not line_items:
-            line_items = [{
-                "product_name": "Detected Item",
-                "quantity": 1,
-                "price": parsed["total"]
-            }]
-
-        parsed["line_items"] = line_items
-
-        # ----------------------------
-        # CONFIDENCE SCORE
-        # ----------------------------
-        score = sum([
-            bool(parsed["vendor_name"]),
-            bool(parsed["invoice_number"]),
-            bool(parsed["invoice_date"]),
-            bool(parsed["total"]),
-            bool(parsed["line_items"])
-        ]) * 0.2
-
-        parsed["confidence_score"] = round(score, 2)
-
-        return parsed
+            if isinstance(refined, list) and refined:
+                items = refined
 
     except Exception as e:
-        return {
-            "vendor_name": "unknown",
-            "invoice_number": "",
-            "invoice_date": "",
-            "total": 0,
-            "currency": "INR",
-            "line_items": [{
-                "product_name": "Error Item",
-                "quantity": 1,
-                "price": 0
-            }],
-            "confidence_score": 0.3,
-            "error": str(e)
-        }
+        print("⚠️ Gemini failed:", e)
+
+    # fallback
+    if not items:
+        items = [{
+            "product_name": "Item",
+            "quantity": 1,
+            "price": totals.get("total", 0)
+        }]
+
+    result = {
+        "vendor_name": match_vendor(ocr_text),
+        "invoice_number": base.get("invoice_number", ""),
+        "invoice_date": base.get("invoice_date", ""),
+        "currency": "INR",
+        "subtotal": totals.get("subtotal"),
+        "cgst": totals.get("cgst"),
+        "sgst": totals.get("sgst"),
+        "total": totals.get("total"),
+        "line_items": items
+    }
+
+    result["confidence_score"] = ai_confidence(result)
+
+    return result
