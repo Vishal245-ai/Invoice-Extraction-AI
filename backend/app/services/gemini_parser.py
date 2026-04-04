@@ -33,7 +33,19 @@ def safe_json_load(text: str):
     return {}
 
 # ----------------------------
-# ✅ VENDOR EXTRACTION + MATCH
+# ✅ PRODUCT FROM RAW OCR (🔥 BEST METHOD)
+# ----------------------------
+def extract_product_from_text(text):
+    match = re.search(
+        r"\d+\s+([A-Za-z0-9\s\-]+?(?:Buds|Phone|Laptop|Headphones|Watch|Tablet|Camera)[^\n]+)",
+        text
+    )
+    if match:
+        return match.group(1).strip()
+    return None
+
+# ----------------------------
+# ✅ VENDOR EXTRACTION
 # ----------------------------
 def extract_vendor(text):
     for line in text.split("\n")[:20]:
@@ -48,7 +60,7 @@ def match_vendor(text):
     return match[0] if match else extracted
 
 # ----------------------------
-# ✅ TOTAL + GST EXTRACTION
+# ✅ TOTAL + GST
 # ----------------------------
 def extract_totals(text):
     data = {}
@@ -94,7 +106,7 @@ def extract_table_block(text):
     return table_lines
 
 # ----------------------------
-# ✅ MULTI-LINE PRODUCT FIX
+# ✅ SMART TABLE PARSER (FIXED)
 # ----------------------------
 def extract_rows(table_lines):
     rows = []
@@ -102,37 +114,44 @@ def extract_rows(table_lines):
 
     for line in table_lines:
 
+        # ❌ Skip garbage lines
         if re.search(r"(HSN|IMEI|GST|CGST|SGST|IGST|UOM|DISCOUNT)", line, re.I):
             continue
 
-        # Product name continuation
+        if re.search(r"(AMOUNT|RATE|TAX|TOTAL)", line, re.I):
+            continue
+
+        # Product text continuation
         if not re.search(r"\d+\.\d{2}", line):
-            product_lines.append(line)
+            if len(line.split()) > 2:
+                product_lines.append(line)
             continue
 
         numbers = [float(n) for n in re.findall(r"\d+\.\d{2}", line)]
-
         if not numbers:
             continue
 
-        # ✅ FIX: ignore small tax values
+        # price selection
         price_candidates = [n for n in numbers if n > 1000]
         price = max(price_candidates) if price_candidates else max(numbers)
 
-        # Quantity
+        # quantity
         quantity = 1
         qty_match = re.search(r"\b([1-9]|10)\b", line)
         if qty_match:
             quantity = int(qty_match.group(1))
 
-        # Merge product name
+        # merge product name
         name = " ".join(product_lines)
-        product_lines = []
 
+        # clean
+        name = re.sub(r"(AMOUNT|RATE|TAX|CGST|SGST|IGST)", "", name, flags=re.I)
         name = re.sub(r"\b\d{10,}\b", "", name)
         name = re.sub(r"\s+", " ", name).strip()
 
-        if len(name) < 5:
+        product_lines = []
+
+        if len(name) < 10:
             continue
 
         rows.append({
@@ -198,9 +217,22 @@ def parse_invoice(ocr_text: str, hint=None):
 
     base = extract_basic(ocr_text)
     totals = extract_totals(ocr_text)
+
+    # 🔥 PRIORITY PRODUCT EXTRACTION
+    direct_product = extract_product_from_text(ocr_text)
+
+    # fallback table parser
     items = extract_line_items_smart(ocr_text)
 
-    # Gemini cleanup (safe)
+    # 🔥 OVERRIDE (fixes your issue)
+    if direct_product:
+        items = [{
+            "product_name": direct_product,
+            "quantity": 1,
+            "price": totals.get("total", 0)
+        }]
+
+    # Gemini cleanup
     try:
         if items:
             prompt = f"""
@@ -224,7 +256,7 @@ Return JSON list only.
     except Exception as e:
         print("⚠️ Gemini failed:", e)
 
-    # fallback
+    # fallback safety
     if not items:
         items = [{
             "product_name": "Item",
