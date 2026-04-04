@@ -36,14 +36,21 @@ def safe_json_load(text: str):
 # ✅ PRODUCT FROM RAW OCR (🔥 BEST METHOD)
 # ----------------------------
 def extract_product_from_text(text):
+    """
+    Extract clean product name (stop before numeric columns)
+    """
     match = re.search(
-        r"\d+\s+([A-Za-z0-9\s\-]+?(?:Buds|Phone|Laptop|Headphones|Watch|Tablet|Camera)[^\n]+)",
+        r"\d+\s+([A-Za-z0-9\s\-]+?)(?=\s+\d{4,}|\s+\d+\.\d{2})",
         text
     )
     if match:
-        return match.group(1).strip()
+       name = match.group(1).strip()
+    # remove trailing junk if any
+    name = re.sub(r"\s{2,}", " ", name)
+    name = re.sub(r"[^\w\s\-]", "", name)
+    
+    return name
     return None
-
 # ----------------------------
 # ✅ VENDOR EXTRACTION
 # ----------------------------
